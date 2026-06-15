@@ -1,0 +1,520 @@
+---
+title: "scn1lab snRNA-seq — median+5SD filter, SCTransform, clustree"
+author: "Sicong"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+## How to run
+
+1. CellRanger matrices under `data/<sample_folder>/` (`barcodes.tsv.gz`, `features.tsv.gz`, `matrix.mtx.gz`).
+2. QC filter is fixed in this pipeline: **nFeature min = 200**, **nFeature max = per-sample median + 5 × SD**, **mt_max = 3**, singlets only.
+3. Step 6: **merged filtered object** → SCTransform → Harmony → UMAP. If SCT fails (e.g. out of memory), **falls back to LogNormalize** automatically.
+4. **Step 6 workflow** — run in order:
+   - **6a** SCTransform (or LogNormalize fallback) + Harmony + UMAP + FindNeighbors
+   - **6b** clustree — pick resolution from `clustree.png`
+   - **6c** clustering + UMAP plots — set `clustering_resolutions` then run
+5. RStudio → set working directory to repo root (`snRNAseq_median5sd_clustering/`), then **Run All** or run chunks step by step.
+
+Helpers: `scripts/snRNAseq_qc_filter_helpers.R`, `snRNAseq_median5sd_clustree_helpers.R` (under repo root).
+
+**Steps:** per-sample Seurat → scDblFinder → merge → exploratory QC → filter → SCTransform/Harmony/UMAP/clustree/clustering.
+
+Mitochondrial genes: `^mt-`.
+
+---
+
+## Pipeline options
+
+```{r pipeline-options}
+if (!exists("find_repo_root", mode = "function")) {
+  rr <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+  for (i in seq_len(6)) {
+    f <- file.path(rr, "scripts", "repo_root.R")
+    if (file.exists(f)) {
+      source(f)
+      break
+    }
+    rr <- dirname(rr)
+  }
+}
+repo_root <- find_repo_root()
+
+run_step1_3_build_merge  <- TRUE
+run_step4_qc_exploratory <- TRUE
+run_step5_filter         <- TRUE
+run_step6a_sctransform   <- TRUE
+run_step6b_clustree      <- FALSE
+run_step6c_clustering    <- FALSE
+
+run_step4a_filter_diagnostics <- TRUE
+run_step4b_round_grid_preview <- TRUE
+
+# Fixed QC thresholds (median+5SD max is computed per sample from raw merged data)
+nFeature_min   <- 200
+sd_multiplier  <- 5
+mt_max         <- 3
+
+# Step 6b: resolutions scanned for clustree
+clustree_resolutions <- seq(0, 1, 0.1)
+
+# Step 6c: edit after reviewing clustree.png, then set run_step6c_clustering <- TRUE
+clustering_resolutions <- c(0.6)
+
+# Set TRUE to overwrite existing Step 6 outputs for the steps you run
+step6_force_rerun <- FALSE
+
+# Density plot x-axis zoom (Step 4)
+density_xlim_nFeature <- c(0, 6000)
+density_xlim_nCount   <- c(0, 15000)
+
+# Optional zoom boxplots in Step 4 (set both, or leave NULL to skip zoom PNGs)
+qc_zoom_y_min <- NULL
+qc_zoom_y_max <- NULL
+```
+
+---
+
+## Paths and sample map
+
+```{r paths}
+data_root <- file.path(repo_root, "scn1lab_snRNAseq", "data")
+out_dir   <- file.path(repo_root, "scn1lab_snRNAseq", "out")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+gene_label      <- "scn1lab"
+merge_project   <- "scn1lab_snRNA"
+object_prefix   <- "scn1"
+merged_raw_rds  <- file.path(out_dir, "scn1_merged_raw.rds")
+merged_filt_rds <- file.path(out_dir, "scn1_merged_filtered_median5sd.rds")
+list_rds        <- file.path(out_dir, "scn1_seurat_objs_snRNA_seq_list_with_scDblFinder.rds")
+
+samples <- c(
+  scn1_wt_rep1  = "scnWT1",
+  scn1_wt_rep2  = "scnWT2",
+  scn1_wt_rep3  = "scnWT3",
+  scn1_het_rep1 = "scnHET1",
+  scn1_het_rep2 = "scnHET2",
+  scn1_het_rep3 = "scnHET3",
+  scn1_hom_rep1 = "scnHOM1",
+  scn1_hom_rep2 = "scnHOM2",
+  scn1_hom_rep3 = "scnHOM3"
+)
+
+resolve_10x_dir <- function(sample_folder) {
+  sample_dir <- file.path(data_root, sample_folder)
+  required <- c("barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz")
+  missing <- required[!file.exists(file.path(sample_dir, required))]
+  if (length(missing) > 0) {
+    stop("Missing 10x files in ", sample_dir, ": ", paste(missing, collapse = ", "))
+  }
+  sample_dir
+}
+
+paths_check <- data.frame(
+  sample_id = names(samples),
+  folder = unname(samples),
+  matrix_dir = vapply(unname(samples), resolve_10x_dir, character(1)),
+  stringsAsFactors = FALSE
+)
+paths_check
+```
+
+```{r source-helpers}
+source(file.path(repo_root, "scripts", "snRNAseq_qc_filter_helpers.R"))
+source(file.path(repo_root, "scripts", "snRNAseq_median5sd_clustree_helpers.R"))
+```
+
+---
+
+## Packages
+
+```{r install-packages, eval=FALSE}
+install.packages(c("Seurat", "dplyr", "ggplot2", "tibble", "patchwork", "harmony", "future", "clustree"))
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("SingleCellExperiment", "scDblFinder", "glmGamPoi"), update = FALSE, ask = FALSE)
+```
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(tibble)
+  library(SingleCellExperiment)
+  library(scDblFinder)
+})
+```
+
+---
+
+## Step 1 — Per-sample Seurat objects
+
+```{r step1-create-objects, eval=run_step1_3_build_merge}
+seurat_objs <- lapply(names(samples), function(sample_id) {
+  folder <- samples[[sample_id]]
+  tenx_dir <- resolve_10x_dir(folder)
+  message("Reading ", sample_id, " from ", tenx_dir)
+  counts <- Read10X(tenx_dir)
+  obj <- CreateSeuratObject(counts = counts, project = sample_id)
+  obj$orig.ident <- sample_id
+  obj$genotype <- dplyr::case_when(
+    grepl("_wt_", sample_id) ~ "WT",
+    grepl("_het_", sample_id) ~ "HET",
+    grepl("_hom_", sample_id) ~ "HOM",
+    TRUE ~ NA_character_
+  )
+  saveRDS(obj, file.path(out_dir, paste0("seurat.obj_", sample_id, ".RNA.rds")))
+  obj
+})
+names(seurat_objs) <- names(samples)
+
+tibble(
+  sample = names(seurat_objs),
+  n_cells = vapply(seurat_objs, ncol, numeric(1))
+)
+```
+
+---
+
+## Step 2 — scDblFinder (per sample, before merge)
+
+```{r step2-doublets, eval=run_step1_3_build_merge}
+for (sample_id in names(seurat_objs)) {
+  message("scDblFinder: ", sample_id)
+  sce <- as.SingleCellExperiment(seurat_objs[[sample_id]])
+  sce <- scDblFinder(sce)
+  seurat_objs[[sample_id]]$scDblFinder.score <- sce$scDblFinder.score
+  seurat_objs[[sample_id]]$scDblFinder.class <- sce$scDblFinder.class
+}
+
+saveRDS(seurat_objs, list_rds)
+
+doublet_summary <- bind_rows(lapply(names(seurat_objs), function(sample_id) {
+  md <- seurat_objs[[sample_id]]@meta.data
+  tibble(
+    sample = sample_id,
+    n_cells = nrow(md),
+    n_singlet = sum(md$scDblFinder.class == "singlet", na.rm = TRUE),
+    n_doublet = sum(md$scDblFinder.class == "doublet", na.rm = TRUE)
+  )
+})) %>%
+  mutate(doublet_rate = round(100 * n_doublet / n_cells, 2))
+
+write.csv(doublet_summary, file.path(out_dir, "doublet_summary.csv"), row.names = FALSE)
+doublet_summary
+save_doublet_plots(seurat_objs, out_dir, doublet_summary = doublet_summary)
+```
+
+---
+
+## Step 3 — Merge nine samples
+
+```{r step3-merge, eval=run_step1_3_build_merge}
+seurat_all <- merge(
+  x = seurat_objs[[1]],
+  y = seurat_objs[-1],
+  add.cell.ids = names(seurat_objs),
+  project = merge_project
+)
+table(seurat_all$orig.ident)
+saveRDS(seurat_all, merged_raw_rds)
+rm(seurat_objs)
+gc()
+```
+
+```{r step3-load-raw, eval=!run_step1_3_build_merge}
+seurat_all <- readRDS(merged_raw_rds)
+```
+
+---
+
+## Step 4 — Exploratory QC (pre-filter)
+
+Per-sample **nFeature max** = median + `r sd_multiplier` × SD (dotted red line). Global **nFeature min** = `r nFeature_min` (dashed red line).
+
+```{r step4-compute-thresholds, eval=run_step4_qc_exploratory}
+seurat_all <- readRDS(merged_raw_rds)
+seurat_all[["percent.mt"]] <- PercentageFeatureSet(seurat_all, pattern = "^mt-")
+
+md <- seurat_all@meta.data
+md$orig.ident <- factor(md$orig.ident, levels = sort(unique(md$orig.ident)))
+
+per_sample_thresholds <- compute_per_sample_nfeature_max(
+  md,
+  nFeature_min = nFeature_min,
+  sd_multiplier = sd_multiplier
+)
+cell_filter <- make_median5sd_cell_filter(
+  mt_max = mt_max,
+  per_sample_thresholds = per_sample_thresholds,
+  nFeature_min = nFeature_min,
+  sd_multiplier = sd_multiplier
+)
+
+per_sample_thresholds
+cell_filter$mode
+threshold_folder_label_median5sd(cell_filter)
+```
+
+```{r step4-qc-plots, eval=run_step4_qc_exploratory}
+plot_qc_density_per_sample_max(
+  md, "nFeature_RNA", "nFeature — density (zoom)", "nFeature_RNA",
+  per_sample_max = cell_filter$per_sample_max,
+  vline_min = cell_filter$nFeature_min,
+  xlim = density_xlim_nFeature
+)
+plot_qc_density(md, "nCount_RNA", "nCount — density (zoom)", "nCount_RNA",
+                NULL, NULL, xlim = density_xlim_nCount)
+plot_qc_box_per_sample_max(
+  md, "nFeature_RNA", "nFeature — boxplot", "nFeature_RNA",
+  per_sample_max = cell_filter$per_sample_max,
+  hline_min = cell_filter$nFeature_min
+)
+plot_qc_box(md, "nCount_RNA", "nCount — boxplot", "nCount_RNA", NULL, NULL)
+plot_qc_scatter_per_sample_max(
+  md, "nFeature vs nCount — scatter",
+  per_sample_max = cell_filter$per_sample_max,
+  nFeature_min = cell_filter$nFeature_min
+)
+
+save_qc_exploratory_plots_median5sd(
+  md, cell_filter, out_dir, gene_label = gene_label,
+  density_xlim_nFeature = density_xlim_nFeature,
+  density_xlim_nCount = density_xlim_nCount
+)
+
+if (!is.null(qc_zoom_y_min) && !is.null(qc_zoom_y_max)) {
+  save_qc_zoom_box_plots_median5sd(
+    md, out_dir, gene_label = gene_label,
+    th = cell_filter,
+    y_min = qc_zoom_y_min, y_max = qc_zoom_y_max
+  )
+} else {
+  message("Skipping zoom boxplots (set qc_zoom_y_min and qc_zoom_y_max to enable).")
+}
+```
+
+---
+
+## Step 4a — nFeature summary tables
+
+Writes CSVs to `out/threshold_diagnostics/`, including **`per_sample_nfeature_max_median5sd.csv`**.
+
+```{r step4a-threshold-diagnostics, eval=run_step4a_filter_diagnostics}
+if (!exists("cell_filter")) {
+  seurat_all <- readRDS(merged_raw_rds)
+  if (!"percent.mt" %in% colnames(seurat_all@meta.data)) {
+    seurat_all[["percent.mt"]] <- PercentageFeatureSet(seurat_all, pattern = "^mt-")
+  }
+  md_qc <- seurat_all@meta.data
+  md_qc$orig.ident <- factor(md_qc$orig.ident, levels = sort(unique(md_qc$orig.ident)))
+  per_sample_thresholds <- compute_per_sample_nfeature_max(
+    md_qc, nFeature_min = nFeature_min, sd_multiplier = sd_multiplier
+  )
+  cell_filter <- make_median5sd_cell_filter(
+    mt_max = mt_max,
+    per_sample_thresholds = per_sample_thresholds,
+    nFeature_min = nFeature_min,
+    sd_multiplier = sd_multiplier
+  )
+} else {
+  md_qc <- md
+}
+
+threshold_diagnostics <- run_median5sd_threshold_diagnostics(
+  md = md_qc,
+  out_dir = out_dir,
+  cell_filter = cell_filter
+)
+
+threshold_diagnostics$distribution
+threshold_diagnostics$per_sample_max
+```
+
+---
+
+## Step 4b — SD/MAD bounds and round-number grid
+
+Reference tables (fixed filter uses median+5SD per sample; tables help compare alternatives).
+
+```{r step4b-threshold-tables, eval=run_step4b_round_grid_preview}
+if (!exists("threshold_diagnostics")) {
+  stop("Run Step 4a first.")
+}
+threshold_diagnostics$sd_mad_bounds[
+  threshold_diagnostics$sd_mad_bounds$scope == "overall",
+]
+threshold_diagnostics$round_grid
+```
+
+---
+
+### How to read the tables
+
+Note: [`scripts/threshold_diagnostics_note.md`](../../scripts/threshold_diagnostics_note.md)
+
+Applied filter: **`per_sample_nfeature_max_median5sd.csv`** and **`user_filter_impact.csv`**.
+
+---
+
+## Step 5 — Filter cells (median + 5×SD max per sample)
+
+Writes `qc_filter_plots/<label>/`, `filter_summary/<label>/`, and `scn1_merged_filtered_median5sd.rds`.
+
+```{r step5-filter, eval=run_step5_filter}
+seurat_all <- readRDS(merged_raw_rds)
+seurat_all[["percent.mt"]] <- PercentageFeatureSet(seurat_all, pattern = "^mt-")
+
+if (!exists("cell_filter")) {
+  md_tmp <- seurat_all@meta.data
+  per_sample_thresholds <- compute_per_sample_nfeature_max(
+    md_tmp, nFeature_min = nFeature_min, sd_multiplier = sd_multiplier
+  )
+  cell_filter <- make_median5sd_cell_filter(
+    mt_max = mt_max,
+    per_sample_thresholds = per_sample_thresholds,
+    nFeature_min = nFeature_min,
+    sd_multiplier = sd_multiplier
+  )
+}
+
+md_before <- seurat_all@meta.data
+trial <- run_median5sd_threshold_trial(
+  seurat_all,
+  cell_filter,
+  out_dir,
+  md_before = md_before,
+  density_xlim_nFeature = density_xlim_nFeature,
+  density_xlim_nCount = density_xlim_nCount,
+  qc_zoom_y_min = if (!is.null(qc_zoom_y_min)) qc_zoom_y_min else 200,
+  qc_zoom_y_max = if (!is.null(qc_zoom_y_max)) qc_zoom_y_max else 3000
+)
+trial$filter_summary$overall
+trial$filter_summary$cells_per_sample
+
+saveRDS(filter_seurat_by_median5sd(seurat_all, cell_filter), merged_filt_rds)
+```
+
+---
+
+## Step 6 setup (shared)
+
+```{r step6-setup, eval=run_step6a_sctransform || run_step6b_clustree || run_step6c_clustering}
+snRNAseq_median5sd_clustree_init(repo_root = repo_root)
+
+if (!exists("cell_filter")) {
+  cell_filter <- build_cell_filter_from_raw(
+    merged_raw_rds,
+    nFeature_min = nFeature_min,
+    sd_multiplier = sd_multiplier,
+    mt_max = mt_max
+  )
+}
+
+step6_cl_dir <- clustering_dir_median5sd(out_dir, cell_filter)
+step6_paths <- clustering_rds_paths(step6_cl_dir, object_prefix)
+threshold_folder_label_median5sd(cell_filter)
+step6_paths
+```
+
+---
+
+## Step 6a — SCTransform, Harmony, UMAP, FindNeighbors
+
+Filters from raw merge, then **SCTransform on the merged filtered object**. On failure (e.g. memory), uses **LogNormalize** instead.
+
+Output: `{object_prefix}_harmony_prepped.rds`. Skips if exists unless `step6_force_rerun <- TRUE`.
+
+```{r step6a-sctransform, eval=run_step6a_sctransform}
+step6a_result <- run_step6a_sctransform(
+  raw_rds = merged_raw_rds,
+  th = cell_filter,
+  out_dir = out_dir,
+  object_prefix = object_prefix,
+  force = step6_force_rerun
+)
+step6a_result
+if (file.exists(file.path(step6_cl_dir, "sctransform_summary.csv"))) {
+  read.csv(file.path(step6_cl_dir, "sctransform_summary.csv"), stringsAsFactors = FALSE)
+}
+```
+
+---
+
+## Step 6b — clustree
+
+Requires Step 6a. Review `clustree.png`, then set `clustering_resolutions` and enable Step 6c.
+
+Output: `clustree.png`, `{object_prefix}_clustree.rds`, `clustree_resolution_columns.csv`.
+
+```{r step6b-clustree, eval=run_step6b_clustree}
+step6b_result <- run_step6b_clustree(
+  th = cell_filter,
+  out_dir = out_dir,
+  object_prefix = object_prefix,
+  clustree_resolutions = clustree_resolutions,
+  force = step6_force_rerun
+)
+step6b_result
+if (file.exists(file.path(step6_cl_dir, "clustree_resolution_columns.csv"))) {
+  read.csv(file.path(step6_cl_dir, "clustree_resolution_columns.csv"), stringsAsFactors = FALSE)
+}
+```
+
+---
+
+## Step 6c — Clustering + UMAP plots
+
+Requires Step 6a (loads `_clustree.rds` if Step 6b was run, otherwise `_harmony_prepped.rds`).
+
+Edit **`clustering_resolutions`** in Pipeline options before running.
+
+```{r step6c-clustering, eval=run_step6c_clustering}
+clustering_summary <- run_step6c_clustering(
+  th = cell_filter,
+  out_dir = out_dir,
+  object_prefix = object_prefix,
+  resolutions = clustering_resolutions,
+  force = step6_force_rerun
+)
+clustering_summary
+```
+
+---
+
+## Optional — DESeq2 pseudobulk
+
+```r
+# C:/Yale/R/deseq2_snrna_pseudobulk_export.R
+```
+
+---
+
+## Output index
+
+| Path | Step |
+|------|------|
+| `scn1_merged_raw.rds` | 3 |
+| `qc_plots/`, optional `qc_plots/zoom/` | 4 |
+| `threshold_diagnostics/` incl. `per_sample_nfeature_max_median5sd.csv` | 4a–4b |
+| `qc_filter_plots/<label>/`, `filter_summary/<label>/` | 5 |
+| `scn1_merged_filtered_median5sd.rds` | 5 |
+| `clustering/<label>/scn1_harmony_prepped.rds`, `sctransform_summary.csv` | 6a |
+| `clustering/<label>/clustree.png`, `scn1_clustree.rds` | 6b |
+| `clustering/<label>/umap_*.png`, `scn1_harmony_res*.rds` | 6c |
+| `<label>` = `nFmin200_nFmax_median5SD_mtmax3` | |
